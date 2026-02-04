@@ -882,6 +882,35 @@ local function HandleInvokeResponse(player: Player?, requestId: string, success:
 	end
 end
 
+local function ValidateConfig()
+
+	local C = KoreghNet.Config
+
+	C.MaxRateLimit = math.max(1, C.MaxRateLimit)
+	C.MaxRateLimitPerChannel = math.max(1, C.MaxRateLimitPerChannel)
+
+	C.MaxStringLength = math.clamp(C.MaxStringLength, 1, 10000)
+	C.MaxPayloadSize = math.clamp(C.MaxPayloadSize, 256, 1000000)
+
+	C.BatchLimit = math.max(1, C.BatchLimit)
+	C.MaxQueueSize = math.max(C.BatchLimit, C.MaxQueueSize)
+
+	C.QueueWarningThreshold = math.clamp(
+		C.QueueWarningThreshold,
+		1,
+		C.MaxQueueSize
+	)
+
+	C.BufferPoolSize = math.max(0, C.BufferPoolSize)
+	C.DefaultBufferSize = math.max(256, C.DefaultBufferSize)
+
+	C.InvokeDefaultTimeout = math.max(1, C.InvokeDefaultTimeout)
+	C.MaxPendingInvokesPerPlayer = math.max(1, C.MaxPendingInvokesPerPlayer)
+
+	C.MaxDeserializationIterations = math.max(100, C.MaxDeserializationIterations)
+
+end
+
 function KoreghNet.GetHealth()
 	local queueSize = _queueWriteIndex - _queueReadIndex
 	local errorRate = Metrics.TotalErrors / math.max(1, Metrics.TotalEvents)
@@ -1093,6 +1122,7 @@ function KoreghNet.Start()
 	end
 
 	KoreghNet.Config.Started = true
+	ValidateConfig()
 
 	_gateway = ReplicatedStorage:FindFirstChild("Gateway") or Instance.new("RemoteEvent")
 	_gateway.Name = "Gateway"
