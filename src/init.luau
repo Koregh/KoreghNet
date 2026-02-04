@@ -1,5 +1,7 @@
 --!strict
 
+local Types = require(script.Types)
+
 local KoreghNet = {
 	Config = {
 		-- Rate Limiting
