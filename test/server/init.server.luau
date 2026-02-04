@@ -1,3 +1,5 @@
+--!strict
+
 local Net = require(game:GetService("ReplicatedStorage").KoreghNet)
 local Contracts = require(game:GetService("ReplicatedStorage").KoreghNet.NetworkContracts)
 local Guard = require(game:GetService("ReplicatedStorage").KoreghNet.Guard)
