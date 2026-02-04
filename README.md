@@ -1,6 +1,9 @@
+> [!WARNING]
+> This library is in early development and it is not intended to be used for large productions.
+
 # KoreghNet
 
-**High-performance networking system for Roblox** with type-safe validation, rate limiting, circuit breakers, and fast binary serialization.
+**Networking system with type-safe validation, rate limiting, circuit breakers, and binary serialization.
 
 [![Roblox](https://img.shields.io/badge/Roblox-Compatible-00A2FF?style=for-the-badge\&logo=roblox)](https://www.roblox.com)
 [![Luau](https://img.shields.io/badge/Luau-Type--safe-00A2FF?style=for-the-badge)](https://luau-lang.org/)
