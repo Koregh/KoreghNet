@@ -79,9 +79,11 @@ Net.Send("DamagePlayer", 25, workspace.Dummy.Head.Position, workspace.Dummy.Head
 
 * `Net.Start()` → Initialize the system
 * `Net.Send(eventName, ...)` → Send event
+* `Net.Invoke(eventName, timeout, ...)` → Send a request and return a Promise.
 * `Net.RegisterChannel(eventName, callback)` → Receive events
 * `Contracts.Add(channelName, config)` → Add a network contract
 * `Guard.Check(data, schema)` → Validate data
+* `Net.GetHealth()` → Monitor queue sizes, error rates, and active circuit breakers
 
 ---
 
