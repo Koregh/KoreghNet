@@ -220,33 +220,47 @@ function Promise:finally(onFinally)
 	return self
 end
 
-function Promise:await()
+function Promise:await(timeout: number?)
 	if self._status == "Resolved" then
 		return true, self._value
 	elseif self._status == "Rejected" then
 		return false, self._value
+	elseif self._status == "Cancelled" then
+		return false, "Cancelled"
+	end
+	local thread = coroutine.running()
+	local isResumed = false
+
+	local timeoutTask
+	if timeout then
+		timeoutTask = task.delay(timeout, function()
+			if not isResumed then
+				isResumed = true
+				task.spawn(thread, false, "Await timeout")
+			end
+		end)
 	end
 
-	local thread = coroutine.running()
-	local resolved = false
-	local value = nil
+	self:finally(function()
 
-	self:andThen(
-		function(v)
-			resolved = true
-			value = v
-			task.spawn(thread)
-		end,
-		function(err)
-			resolved = false
-			value = err
-			task.spawn(thread)
+		if timeoutTask then task.cancel(timeoutTask) end
+
+		if not isResumed then
+			isResumed = true
+
+			if self._status == "Resolved" then
+				task.spawn(thread, true, self._value)
+			elseif self._status == "Rejected" then
+				task.spawn(thread, false, self._value)
+			else
+				task.spawn(thread, false, "Cancelled")
+			end
 		end
-	)
+	end)
 
-	coroutine.yield()
-	return resolved, value
+	return coroutine.yield()
 end
+
 
 function Promise:cancel()
 	if self._status == "Pending" then
