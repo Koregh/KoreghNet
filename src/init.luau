@@ -3,34 +3,34 @@
 local KoreghNet = {
 	Config = {
 		-- Rate Limiting
-		MaxRateLimit = 15,
-		MaxRateLimitPerChannel = 25,
+		MaxRateLimit = 15, -- Events per second per player, change only if necessary
+		MaxRateLimitPerChannel = 25, -- Adjust if any specific action is being abused.
 
 		-- Payload Limits
-		MaxStringLength = 1024,
-		MaxPayloadSize = 65536,
-		MaxSerializationDepth = 10,
+		MaxStringLength = 1024, -- Maximum text size, increases if you need to send larger texts.
+		MaxPayloadSize = 65536, -- Maximum size of data sent, modify only for larger packets.
+		MaxSerializationDepth = 10, -- Depth of tables, increases if using a lot of data.
 
 		-- Batching
-		BatchLimit = 100,
-		MaxQueueSize = 2000,
-		QueueWarningThreshold = 500,
+		BatchLimit = 100, -- Frame-sent events, scale up for more performance.
+		MaxQueueSize = 2000, -- Maximum events in queue, increase if events are being dropped.
+		QueueWarningThreshold = 500, -- When it starts warning about a full queue.
 
 		-- Circuit Breaker
-		CircuitBreakerThreshold = 50,
-		CircuitBreakerResetTime = 60,
+		CircuitBreakerThreshold = 50, -- Number of errors before blocking the channel.
+		CircuitBreakerResetTime = 60, -- Time to try to reactivate channel after error.
 
 		-- Buffer Pool
-		BufferPoolSize = 10,
-		DefaultBufferSize = 2048,
+		BufferPoolSize = 10, -- Number of buffers reused.
+		DefaultBufferSize = 2048, -- Initial buffer size.
 
 		-- Invoke System
-		InvokeDefaultTimeout = 10,
-		MaxPendingInvokesPerPlayer = 50, 
+		InvokeDefaultTimeout = 10, -- Maximum invoke response time.
+		MaxPendingInvokesPerPlayer = 50,  -- Simultaneous summons per player.
 
 		-- Misc
-		Debug = true,
-		MaxDeserializationIterations = 1000,
+		Debug = true, -- System logs.
+		MaxDeserializationIterations = 1000, -- Protection against loops when reading data.
 
 		-- Internal
 		Started = false,
