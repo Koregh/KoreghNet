@@ -1,6 +1,5 @@
 --!strict
 
-
 local KoreghNet = {
 	Config = {
 		-- Rate Limiting
@@ -24,6 +23,9 @@ local KoreghNet = {
 		-- Buffer Pool
 		BufferPoolSize = 10,
 		DefaultBufferSize = 2048,
+
+		-- Invoke System
+		InvokeDefaultTimeout = 10,
 
 		-- Misc
 		Debug = true,
@@ -78,7 +80,12 @@ local Metrics = {
 	LastSecondReset = os.clock(),
 	PackErrors = 0,
 	UnpackErrors = 0,
-	ByChannel = {}
+	ByChannel = {},
+	-- Invoke metrics
+	InvokePendingRequests = 0,
+	InvokeTimeouts = 0,
+	InvokeErrors = 0,
+	InvokeSuccesses = 0,
 }
 
 function Metrics.RecordEvent(eventName: string)
@@ -105,6 +112,205 @@ function Metrics.Reset()
 		Metrics.EventsThisSecond = 0
 		Metrics.LastSecondReset = now
 	end
+end
+
+local Promise = {}
+Promise.__index = Promise
+
+export type PromiseStatus = "Pending" | "Resolved" | "Rejected" | "Cancelled"
+
+function Promise.new<T>(executor: (resolve: (value: T) -> (), reject: (error: any) -> ()) -> ()): any
+	local self = setmetatable({}, Promise)
+
+	self._status = "Pending" :: PromiseStatus
+	self._value = nil
+	self._callbacks = {}
+	self._errbacks = {}
+	self._finallybacks = {}
+
+	local function resolve(value: T)
+		if self._status ~= "Pending" then return end
+
+		self._status = "Resolved"
+		self._value = value
+
+		for _, callback in ipairs(self._callbacks) do
+			task.spawn(callback, value)
+		end
+
+		for _, finallyback in ipairs(self._finallybacks) do
+			task.spawn(finallyback)
+		end
+	end
+
+	local function reject(error: any)
+		if self._status ~= "Pending" then return end
+
+		self._status = "Rejected"
+		self._value = error
+
+		for _, errback in ipairs(self._errbacks) do
+			task.spawn(errback, error)
+		end
+
+		for _, finallyback in ipairs(self._finallybacks) do
+			task.spawn(finallyback)
+		end
+
+		if #self._errbacks == 0 then
+			warn("[Promise] Unhandled rejection:", error)
+		end
+	end
+
+	task.spawn(function()
+		local success, result = pcall(executor, resolve, reject)
+		if not success then
+			reject(result)
+		end
+	end)
+
+	return self
+end
+
+function Promise:andThen(onResolved, onRejected)
+	return Promise.new(function(resolve, reject)
+		local function handleResolved(value)
+			if onResolved then
+				local success, result = pcall(onResolved, value)
+				if success then
+					resolve(result)
+				else
+					reject(result)
+				end
+			else
+				resolve(value)
+			end
+		end
+
+		local function handleRejected(error)
+			if onRejected then
+				local success, result = pcall(onRejected, error)
+				if success then
+					resolve(result)
+				else
+					reject(result)
+				end
+			else
+				reject(error)
+			end
+		end
+
+		if self._status == "Resolved" then
+			handleResolved(self._value)
+		elseif self._status == "Rejected" then
+			handleRejected(self._value)
+		else
+			table.insert(self._callbacks, handleResolved)
+			table.insert(self._errbacks, handleRejected)
+		end
+	end)
+end
+
+function Promise:catch(onRejected)
+	return self:andThen(nil, onRejected)
+end
+
+function Promise:finally(onFinally)
+	table.insert(self._finallybacks, onFinally)
+	return self
+end
+
+function Promise:await()
+	if self._status == "Resolved" then
+		return true, self._value
+	elseif self._status == "Rejected" then
+		return false, self._value
+	end
+
+	local thread = coroutine.running()
+	local resolved = false
+	local value = nil
+
+	self:andThen(
+		function(v)
+			resolved = true
+			value = v
+			task.spawn(thread)
+		end,
+		function(err)
+			resolved = false
+			value = err
+			task.spawn(thread)
+		end
+	)
+
+	coroutine.yield()
+	return resolved, value
+end
+
+function Promise:cancel()
+	if self._status == "Pending" then
+		self._status = "Cancelled"
+	end
+end
+
+function Promise:getStatus()
+	return self._status
+end
+
+function Promise.resolve<T>(value: T): any
+	return Promise.new(function(resolve)
+		resolve(value)
+	end)
+end
+
+function Promise.reject<T>(error: any): any
+	return Promise.new(function(_, reject)
+		reject(error)
+	end)
+end
+
+function Promise.all<T>(promises: {any}): any
+	return Promise.new(function(resolve, reject)
+		local results = {}
+		local completed = 0
+		local total = #promises
+
+		if total == 0 then
+			resolve({})
+			return
+		end
+
+		for i, promise in ipairs(promises) do
+			promise:andThen(
+				function(value)
+					results[i] = value
+					completed += 1
+
+					if completed == total then
+						resolve(results)
+					end
+				end,
+				reject
+			)
+		end
+	end)
+end
+
+function Promise.race<T>(promises: {any}): any
+	return Promise.new(function(resolve, reject)
+		for _, promise in ipairs(promises) do
+			promise:andThen(resolve, reject)
+		end
+	end)
+end
+
+function Promise.delay(seconds: number): any
+	return Promise.new(function(resolve)
+		task.delay(seconds, function()
+			resolve(seconds)
+		end)
+	end)
 end
 
 local Types = require(script.SerializerTypes)
@@ -135,6 +341,15 @@ local CircuitBreakers: {[string]: {
 local BufferPool: {buffer} = {}
 local BufferPoolLock = false
 
+-- Invoke System
+local _invokeHandlers: {[string]: (Player?, ...any) -> ...any} = {}
+local _pendingInvokes: {[string]: {
+	Resolve: (any) -> (),
+	Reject: (any) -> (),
+	Timeout: number,
+}} = {}
+local _invokeCounter = 0
+
 local function GetBuffer(size: number?): buffer
 	local requestedSize = size or KoreghNet.Config.DefaultBufferSize
 
@@ -157,7 +372,6 @@ local function ReturnBuffer(buf: buffer)
 	end
 end
 
-
 function KoreghNet.AddMiddleware(fn: (player: Player?, eventName: string, args: {any}) -> boolean)
 	if typeof(fn) ~= "function" then
 		Log.error("Middleware", "Middleware should be a function")
@@ -178,7 +392,6 @@ function KoreghNet.RemoveMiddleware(fn: (player: Player?, eventName: string, arg
 	end
 	return false
 end
-
 
 local function IsRateLimited(player: Player, eventName: string): boolean
 	local now = os.clock()
@@ -284,14 +497,12 @@ local function sanitize(val: any, depth: number?, seen: {[any]: boolean}?): any
 		return val
 
 	elseif typ == "number" then
-		-- Replace NaN and infinities with zero
 		if val ~= val or val == math.huge or val == -math.huge then 
 			return 0 
 		end
 		return val
 
 	elseif typ == "table" then
-		-- Protection against circular references
 		if s[val] then 
 			Log.debug("Sanitize", "Circular reference detected")
 			return nil 
@@ -316,7 +527,6 @@ local function sanitize(val: any, depth: number?, seen: {[any]: boolean}?): any
 		return val
 	end
 end
-
 
 local function ShouldBreakCircuit(eventName: string): boolean
 	local breaker = CircuitBreakers[eventName]
@@ -411,7 +621,7 @@ function KoreghNet.Pack(...: any): any
 		end
 		return fallbackArgs
 	end
-	
+
 	local final = buffer.create(cursor)
 	buffer.copy(final, 0, temp, 0, cursor)
 	ReturnBuffer(temp)
@@ -439,7 +649,6 @@ function KoreghNet.Unpack(payload: any): {any}
 	while cursor < payloadLen do
 		iterations += 1
 
-		-- Proteção contra loop infinito
 		if iterations > KoreghNet.Config.MaxDeserializationIterations then
 			Log.error("Unpack", "Maximum iterations reached in deserialization")
 			Metrics.UnpackErrors += 1
@@ -460,6 +669,105 @@ function KoreghNet.Unpack(payload: any): {any}
 	return args
 end
 
+local function GenerateInvokeId(): string
+	_invokeCounter += 1
+	return HttpService:GenerateGUID(false) .. "_" .. _invokeCounter
+end
+
+function KoreghNet.Invoke(eventName: string, timeout: number?, ...: any): any
+	local args = {...} 
+	local requestId = GenerateInvokeId()
+	local timeoutDuration = timeout or KoreghNet.Config.InvokeDefaultTimeout
+
+	return Promise.new(function(resolve, reject)
+		Metrics.InvokePendingRequests += 1
+
+		_pendingInvokes[requestId] = {
+			Resolve = resolve,
+			Reject = reject,
+			Timeout = os.clock() + timeoutDuration,
+		}
+
+		task.delay(timeoutDuration, function()
+			local request = _pendingInvokes[requestId]
+			if request then
+				_pendingInvokes[requestId] = nil
+				Metrics.InvokePendingRequests -= 1
+				Metrics.InvokeTimeouts += 1
+				reject(`Request timeout after {timeoutDuration}s`)
+			end
+		end)
+
+		KoreghNet.Send("__INVOKE_REQUEST__", requestId, eventName, table.unpack(args))
+	end)
+end
+
+function KoreghNet.RegisterInvokeHandler(eventName: string, handler: (Player?, ...any) -> ...any): boolean
+	if typeof(eventName) ~= "string" or #eventName == 0 then
+		Log.error("Invoke", "eventName must be a non-empty string")
+		return false
+	end
+
+	if typeof(handler) ~= "function" then
+		Log.error("Invoke", "handler must be a function")
+		return false
+	end
+
+	if _invokeHandlers[eventName] then
+		Log.warn("Invoke", `Handler already registered for '{eventName}'`)
+		return false
+	end
+
+	_invokeHandlers[eventName] = handler
+	Log.debug("Invoke", `Registered invoke handler: {eventName}`)
+	return true
+end
+
+function KoreghNet.UnregisterInvokeHandler(eventName: string)
+	_invokeHandlers[eventName] = nil
+	Log.debug("Invoke", `Unregistered invoke handler: {eventName}`)
+end
+
+local function HandleInvokeRequest(player: Player?, requestId: string, eventName: string, args: {any})
+	local handler = _invokeHandlers[eventName]
+
+	if not handler then
+		KoreghNet.Send("__INVOKE_RESPONSE__", requestId, false, `No handler for '{eventName}'`)
+		return
+	end
+
+	task.spawn(function()
+		local success, result = pcall(handler, player, table.unpack(args))
+
+		if success then
+			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, true, result)
+			Metrics.InvokeSuccesses += 1
+		else
+			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, false, result)
+			Metrics.InvokeErrors += 1
+		end
+	end)
+end
+
+local function HandleInvokeResponse(requestId: string, success: boolean, result: any)
+	local request = _pendingInvokes[requestId]
+
+	if not request then
+		Log.warn("Invoke", `Received response for unknown request: {requestId}`)
+		return
+	end
+
+	_pendingInvokes[requestId] = nil
+	Metrics.InvokePendingRequests -= 1
+
+	if success then
+		request.Resolve(result)
+		Metrics.InvokeSuccesses += 1
+	else
+		request.Reject(result)
+		Metrics.InvokeErrors += 1
+	end
+end
 
 function KoreghNet.GetHealth()
 	local queueSize = #_outboundQueue
@@ -467,24 +775,20 @@ function KoreghNet.GetHealth()
 	local status = "HEALTHY"
 	local issues = {}
 
-	-- Queue size check
 	if queueSize > KoreghNet.Config.QueueWarningThreshold then 
 		status = "DEGRADED"
 		table.insert(issues, `Queue: {queueSize}`) 
 	end
 
-	-- Error rate check
 	if errorRate > 0.05 then 
 		status = "DEGRADED"
 		table.insert(issues, `Errors: {math.floor(errorRate * 100)}%`) 
 	end
 
-	-- Critical thresholds
 	if queueSize > KoreghNet.Config.MaxQueueSize or errorRate > 0.1 then 
 		status = "CRITICAL" 
 	end
 
-	-- Circuit breaker check
 	local brokenCircuits = 0
 	for _, breaker in pairs(CircuitBreakers) do
 		if breaker.Broken then
@@ -505,7 +809,8 @@ function KoreghNet.GetHealth()
 			QueueSize = queueSize, 
 			EventsPerSecond = Metrics.EventsPerSecond, 
 			ErrorRate = errorRate,
-			BrokenCircuits = brokenCircuits
+			BrokenCircuits = brokenCircuits,
+			InvokePendingRequests = Metrics.InvokePendingRequests,
 		}
 	}
 end
@@ -520,14 +825,17 @@ function KoreghNet.GetMetrics()
 		PackErrors = Metrics.PackErrors,
 		UnpackErrors = Metrics.UnpackErrors,
 		QueueSize = #_outboundQueue,
-		ByChannel = Metrics.ByChannel
+		ByChannel = Metrics.ByChannel,
+		InvokePendingRequests = Metrics.InvokePendingRequests,
+		InvokeTimeouts = Metrics.InvokeTimeouts,
+		InvokeErrors = Metrics.InvokeErrors,
+		InvokeSuccesses = Metrics.InvokeSuccesses,
 	}
 end
 
 function KoreghNet.GetChannelMetrics(eventName: string)
 	return Metrics.ByChannel[eventName] or { Count = 0, Errors = 0 }
 end
-
 
 function KoreghNet.LogEvent(eventName: string, player: Player?, err: string, args: {any})
 	Metrics.RecordError(eventName)
@@ -549,7 +857,6 @@ function KoreghNet.LogEvent(eventName: string, player: Player?, err: string, arg
 		Log.error("EventError", `Failed to serialize log: {encoded}`)
 	end
 end
-
 
 function KoreghNet.Send(eventName: string, ...: any)
 	if not KoreghNet.Config.Started then
@@ -599,7 +906,6 @@ function KoreghNet.UnregisterChannel(eventName: string): boolean
 	end
 	return false
 end
-
 
 function KoreghNet._onEvent(player: Player?, eventName: string, payload: any)
 	local ch = _channels[eventName]
@@ -678,6 +984,15 @@ function KoreghNet.Start()
 	Log.info("Lifecycle", "Starting network system...")
 	Log.info("Config", `BatchLimit: {KoreghNet.Config.BatchLimit}, MaxPayloadSize: {KoreghNet.Config.MaxPayloadSize}`)
 
+	-- Register internal invoke channels
+	KoreghNet.RegisterChannel("__INVOKE_REQUEST__", function(player, requestId, eventName, ...)
+		HandleInvokeRequest(player, requestId, eventName, {...})
+	end)
+
+	KoreghNet.RegisterChannel("__INVOKE_RESPONSE__", function(player, requestId, success, result)
+		HandleInvokeResponse(requestId, success, result)
+	end)
+
 	-- Server-side event handling
 	if RunService:IsServer() then
 		_gateway.OnServerEvent:Connect(function(player, batch)
@@ -694,7 +1009,7 @@ function KoreghNet.Start()
 			if IsRateLimited(player, "__GLOBAL__") then 
 				return 
 			end
-			
+
 			for _, packet in ipairs(batch) do
 				if typeof(packet) == "table" and packet[1] and packet[2] then
 					KoreghNet._onEvent(player, packet[1], packet[2])
@@ -703,8 +1018,6 @@ function KoreghNet.Start()
 		end)
 
 		Players.PlayerRemoving:Connect(CleanupPlayerData)
-
-		
 	else
 		-- Client-side event handling
 		_gateway.OnClientEvent:Connect(function(batch)
@@ -720,6 +1033,17 @@ function KoreghNet.Start()
 
 	RunService.Heartbeat:Connect(function()
 		Metrics.Reset()
+
+		-- Cleanup timed out invokes
+		local now = os.clock()
+		for requestId, request in pairs(_pendingInvokes) do
+			if now > request.Timeout then
+				_pendingInvokes[requestId] = nil
+				Metrics.InvokePendingRequests -= 1
+				Metrics.InvokeTimeouts += 1
+				request.Reject("Request timeout")
+			end
+		end
 
 		-- Update health status
 		local health = KoreghNet.GetHealth()
@@ -776,11 +1100,15 @@ function KoreghNet.Stop()
 	_middlewares = {}
 	_outboundQueue = {}
 	CircuitBreakers = {}
+	_invokeHandlers = {}
+	_pendingInvokes = {}
 
 	BufferPoolLock = true
 	BufferPool = {}
 
 	Log.info("Lifecycle", "System stopped")
 end
+
+KoreghNet.Promise = Promise
 
 return KoreghNet
