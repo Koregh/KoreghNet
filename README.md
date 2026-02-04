@@ -3,7 +3,7 @@
 
 # KoreghNet
 
-**Networking system with type-safe validation, rate limiting, circuit breakers, and binary serialization.
+**Networking system with type-safe validation, rate limiting, circuit breakers, and binary serialization.**
 
 [![Roblox](https://img.shields.io/badge/Roblox-Compatible-00A2FF?style=for-the-badge\&logo=roblox)](https://www.roblox.com)
 [![Luau](https://img.shields.io/badge/Luau-Type--safe-00A2FF?style=for-the-badge)](https://luau-lang.org/)
