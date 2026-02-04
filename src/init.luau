@@ -26,6 +26,7 @@ local KoreghNet = {
 
 		-- Invoke System
 		InvokeDefaultTimeout = 10,
+		MaxPendingInvokesPerPlayer = 50, 
 
 		-- Misc
 		Debug = true,
@@ -81,11 +82,12 @@ local Metrics = {
 	PackErrors = 0,
 	UnpackErrors = 0,
 	ByChannel = {},
-	-- Invoke metrics
+	
 	InvokePendingRequests = 0,
 	InvokeTimeouts = 0,
 	InvokeErrors = 0,
 	InvokeSuccesses = 0,
+	InvokeRejectedDuplicates = 0, 
 }
 
 function Metrics.RecordEvent(eventName: string)
@@ -261,10 +263,13 @@ function Promise:await(timeout: number?)
 	return coroutine.yield()
 end
 
-
 function Promise:cancel()
 	if self._status == "Pending" then
 		self._status = "Cancelled"
+
+		for _, finallyback in ipairs(self._finallybacks) do
+			task.spawn(finallyback)
+		end
 	end
 end
 
@@ -340,7 +345,11 @@ local _gateway: RemoteEvent
 local _playerRateLimits: {[Player]: {[string]: {Count: number, LastReset: number}}} = {}
 local _channels: {[string]: {Callback: (Player?, ...any) -> ()}} = {}
 local _middlewares: {(player: Player?, eventName: string, args: {any}) -> boolean} = {}
+
 local _outboundQueue: {{string: any}} = {}
+local _queueReadIndex = 1
+local _queueWriteIndex = 1
+
 local _lastStatus = ""
 
 -- Circuit Breakers
@@ -357,12 +366,17 @@ local BufferPoolLock = false
 
 -- Invoke System
 local _invokeHandlers: {[string]: (Player?, ...any) -> ...any} = {}
+
 local _pendingInvokes: {[string]: {
 	Resolve: (any) -> (),
 	Reject: (any) -> (),
 	Timeout: number,
+	TimeoutTask: thread?, 
+	PlayerId: number?,
 }} = {}
+
 local _invokeCounter = 0
+local _playerInvokeCount: {[number]: number} = {} 
 
 local function GetBuffer(size: number?): buffer
 	local requestedSize = size or KoreghNet.Config.DefaultBufferSize
@@ -450,6 +464,21 @@ local function CleanupPlayerData(player: Player)
 			breaker.LastPlayer = nil
 		end
 	end
+	
+	local playerId = player.UserId
+	for requestId, request in pairs(_pendingInvokes) do
+		if request.PlayerId == playerId then
+			if request.TimeoutTask then
+				task.cancel(request.TimeoutTask)
+			end
+
+			_pendingInvokes[requestId] = nil
+			Metrics.InvokePendingRequests -= 1
+			request.Reject("Player disconnected")
+		end
+	end
+
+	_playerInvokeCount[playerId] = nil
 
 	Log.debug("Cleanup", `Player {player.Name} data cleared`)
 end
@@ -481,17 +510,23 @@ local function _readAny(b: buffer, cur: number): (any, number)
 	local id = buffer.readu8(b, cur)
 	local h = Types.Handlers[id]
 
-	if h then
-		local success, val, size = pcall(h.Read, b, cur + 1, _readAny)
-		if success then
-			return val, 1 + size
-		else
-			Log.error("Deserialization", `Error reading ID type {id}: {val}`)
-			return nil, 1
-		end
+	if not h then
+		Log.error("Deserialization", `Invalid type ID {id} at position {cur}. Aborting read.`)
+		Metrics.UnpackErrors += 1
+		return nil, buffer.len(b) - cur
 	end
 
-	return nil, 1
+	local success, val, size = pcall(h.Read, b, cur + 1, _readAny)
+	if success then
+		if size < 0 or size > buffer.len(b) then
+			Log.error("Deserialization", `Invalid size {size} returned for type {id}`)
+			return nil, buffer.len(b) - cur
+		end
+		return val, 1 + size
+	else
+		Log.error("Deserialization", `Error reading ID type {id}: {val}`)
+		return nil, 1
+	end
 end
 
 local function sanitize(val: any, depth: number?, seen: {[any]: boolean}?): any
@@ -676,6 +711,11 @@ function KoreghNet.Unpack(payload: any): {any}
 			break
 		end
 
+		if val == nil and size >= (payloadLen - cursor) then
+			Log.error("Unpack", "Corrupted buffer detected, aborting")
+			break
+		end
+
 		table.insert(args, val)
 		cursor += size
 	end
@@ -683,34 +723,74 @@ function KoreghNet.Unpack(payload: any): {any}
 	return args
 end
 
-local function GenerateInvokeId(): string
+local function GenerateInvokeId(playerId: number?): string
 	_invokeCounter += 1
-	return HttpService:GenerateGUID(false) .. "_" .. _invokeCounter
+	local guid = HttpService:GenerateGUID(false)
+
+	if playerId then
+		return `{playerId}_{guid}_{_invokeCounter}`
+	else
+		return `{guid}_{_invokeCounter}`
+	end
+end
+
+local function CleanupInvoke(requestId: string, reason: string)
+	local request = _pendingInvokes[requestId]
+	if not request then return end
+
+	if request.TimeoutTask then
+		task.cancel(request.TimeoutTask)
+		request.TimeoutTask = nil
+	end
+
+	if request.PlayerId then
+		_playerInvokeCount[request.PlayerId] = math.max(0, (_playerInvokeCount[request.PlayerId] or 1) - 1)
+	end
+
+	_pendingInvokes[requestId] = nil
+	Metrics.InvokePendingRequests = math.max(0, Metrics.InvokePendingRequests - 1)
+
+	request.Reject(reason)
 end
 
 function KoreghNet.Invoke(eventName: string, timeout: number?, ...: any): any
-	local args = {...} 
-	local requestId = GenerateInvokeId()
+	local args = {...}
+
+	local playerId: number? = nil
+	if RunService:IsClient() then
+		local player = Players.LocalPlayer
+		if player then
+			playerId = player.UserId
+
+			local count = _playerInvokeCount[playerId] or 0
+			if count >= KoreghNet.Config.MaxPendingInvokesPerPlayer then
+				return Promise.reject(`Too many pending invokes ({count})`)
+			end
+		end
+	end
+
+	local requestId = GenerateInvokeId(playerId)
 	local timeoutDuration = timeout or KoreghNet.Config.InvokeDefaultTimeout
 
 	return Promise.new(function(resolve, reject)
 		Metrics.InvokePendingRequests += 1
 
+		if playerId then
+			_playerInvokeCount[playerId] = (_playerInvokeCount[playerId] or 0) + 1
+		end
+
+		local timeoutTask = task.delay(timeoutDuration, function()
+			Metrics.InvokeTimeouts += 1
+			CleanupInvoke(requestId, `Request timeout after {timeoutDuration}s`)
+		end)
+
 		_pendingInvokes[requestId] = {
 			Resolve = resolve,
 			Reject = reject,
 			Timeout = os.clock() + timeoutDuration,
+			TimeoutTask = timeoutTask,
+			PlayerId = playerId,
 		}
-
-		task.delay(timeoutDuration, function()
-			local request = _pendingInvokes[requestId]
-			if request then
-				_pendingInvokes[requestId] = nil
-				Metrics.InvokePendingRequests -= 1
-				Metrics.InvokeTimeouts += 1
-				reject(`Request timeout after {timeoutDuration}s`)
-			end
-		end)
 
 		KoreghNet.Send("__INVOKE_REQUEST__", requestId, eventName, table.unpack(args))
 	end)
@@ -743,6 +823,15 @@ function KoreghNet.UnregisterInvokeHandler(eventName: string)
 end
 
 local function HandleInvokeRequest(player: Player?, requestId: string, eventName: string, args: {any})
+	if player and RunService:IsServer() then
+		local expectedPrefix = tostring(player.UserId) .. "_"
+		if not string.match(requestId, "^" .. expectedPrefix) then
+			Log.warn("Invoke", `Player {player.Name} sent invalid requestId: {requestId}`)
+			Metrics.InvokeRejectedDuplicates += 1
+			return
+		end
+	end
+
 	local handler = _invokeHandlers[eventName]
 
 	if not handler then
@@ -751,40 +840,50 @@ local function HandleInvokeRequest(player: Player?, requestId: string, eventName
 	end
 
 	task.spawn(function()
-		local success, result = pcall(handler, player, table.unpack(args))
+		local results = table.pack(pcall(handler, player, table.unpack(args)))
+		local success = table.remove(results, 1)
 
 		if success then
-			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, true, result)
+			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, true, table.unpack(results, 1, results.n))
 			Metrics.InvokeSuccesses += 1
 		else
-			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, false, result)
+			KoreghNet.Send("__INVOKE_RESPONSE__", requestId, false, results[1])
 			Metrics.InvokeErrors += 1
 		end
 	end)
 end
 
-local function HandleInvokeResponse(requestId: string, success: boolean, result: any)
+local function HandleInvokeResponse(player: Player?, requestId: string, success: boolean, ...)
 	local request = _pendingInvokes[requestId]
 
 	if not request then
-		Log.warn("Invoke", `Received response for unknown request: {requestId}`)
+		Log.warn("Invoke", `Received response for unknown/expired request: {requestId}`)
 		return
 	end
 
-	_pendingInvokes[requestId] = nil
-	Metrics.InvokePendingRequests -= 1
+	if RunService:IsServer() and player then
+		Log.warn("Invoke", `Player {player.Name} tried to spoof invoke response`)
+		return
+	end
+
+	local resolve = request.Resolve
+	local reject = request.Reject
+
+	CleanupInvoke(requestId, "Response received")
+
+	local results = table.pack(...)
 
 	if success then
-		request.Resolve(result)
+		resolve(table.unpack(results, 1, results.n))
 		Metrics.InvokeSuccesses += 1
 	else
-		request.Reject(result)
+		reject(results[1])
 		Metrics.InvokeErrors += 1
 	end
 end
 
 function KoreghNet.GetHealth()
-	local queueSize = #_outboundQueue
+	local queueSize = _queueWriteIndex - _queueReadIndex
 	local errorRate = Metrics.TotalErrors / math.max(1, Metrics.TotalEvents)
 	local status = "HEALTHY"
 	local issues = {}
@@ -838,12 +937,13 @@ function KoreghNet.GetMetrics()
 		CircuitBreakerTrips = Metrics.CircuitBreakerTrips,
 		PackErrors = Metrics.PackErrors,
 		UnpackErrors = Metrics.UnpackErrors,
-		QueueSize = #_outboundQueue,
+		QueueSize = _queueWriteIndex - _queueReadIndex,
 		ByChannel = Metrics.ByChannel,
 		InvokePendingRequests = Metrics.InvokePendingRequests,
 		InvokeTimeouts = Metrics.InvokeTimeouts,
 		InvokeErrors = Metrics.InvokeErrors,
 		InvokeSuccesses = Metrics.InvokeSuccesses,
+		InvokeRejectedDuplicates = Metrics.InvokeRejectedDuplicates,
 	}
 end
 
@@ -884,10 +984,13 @@ function KoreghNet.Send(eventName: string, ...: any)
 	end
 
 	local payload = KoreghNet.Pack(...)
-	table.insert(_outboundQueue, {eventName, payload})
 
-	if #_outboundQueue > KoreghNet.Config.QueueWarningThreshold then
-		Log.warn("Queue", `Queue size: {#_outboundQueue}`)
+	_outboundQueue[_queueWriteIndex] = {eventName, payload}
+	_queueWriteIndex += 1
+
+	local queueSize = _queueWriteIndex - _queueReadIndex
+	if queueSize > KoreghNet.Config.QueueWarningThreshold then
+		Log.warn("Queue", `Queue size: {queueSize}`)
 	end
 end
 
@@ -998,13 +1101,12 @@ function KoreghNet.Start()
 	Log.info("Lifecycle", "Starting network system...")
 	Log.info("Config", `BatchLimit: {KoreghNet.Config.BatchLimit}, MaxPayloadSize: {KoreghNet.Config.MaxPayloadSize}`)
 
-	-- Register internal invoke channels
 	KoreghNet.RegisterChannel("__INVOKE_REQUEST__", function(player, requestId, eventName, ...)
 		HandleInvokeRequest(player, requestId, eventName, {...})
 	end)
 
-	KoreghNet.RegisterChannel("__INVOKE_RESPONSE__", function(player, requestId, success, result)
-		HandleInvokeResponse(requestId, success, result)
+	KoreghNet.RegisterChannel("__INVOKE_RESPONSE__", function(player, requestId, success, ...)
+		HandleInvokeResponse(player, requestId, success, ...)
 	end)
 
 	-- Server-side event handling
@@ -1048,18 +1150,6 @@ function KoreghNet.Start()
 	RunService.Heartbeat:Connect(function()
 		Metrics.Reset()
 
-		-- Cleanup timed out invokes
-		local now = os.clock()
-		for requestId, request in pairs(_pendingInvokes) do
-			if now > request.Timeout then
-				_pendingInvokes[requestId] = nil
-				Metrics.InvokePendingRequests -= 1
-				Metrics.InvokeTimeouts += 1
-				request.Reject("Request timeout")
-			end
-		end
-
-		-- Update health status
 		local health = KoreghNet.GetHealth()
 		if health.Status ~= _lastStatus then 
 			_lastStatus = health.Status
@@ -1070,27 +1160,52 @@ function KoreghNet.Start()
 			end
 		end
 
-		-- Process outbound queue
-		if #_outboundQueue == 0 then return end
+		local queueSize = _queueWriteIndex - _queueReadIndex
+		if queueSize == 0 then return end
 
 		local batch = {}
-		local toProcess = math.min(#_outboundQueue, KoreghNet.Config.BatchLimit)
+		local toProcess = math.min(queueSize, KoreghNet.Config.BatchLimit)
 
-		for i = 1, toProcess do
-			table.insert(batch, table.remove(_outboundQueue, 1))
+		for i = 0, toProcess - 1 do
+			local index = _queueReadIndex + i
+			table.insert(batch, _outboundQueue[index])
+			_outboundQueue[index] = nil 
 		end
 
-		if #_outboundQueue > KoreghNet.Config.QueueWarningThreshold then 
-			Log.warn("Queue", `Overflow: {#_outboundQueue} items remaining.`) 
+		_queueReadIndex += toProcess
+
+		if _queueReadIndex >= _queueWriteIndex then
+			_queueReadIndex = 1
+			_queueWriteIndex = 1
 		end
 
-		if #_outboundQueue > KoreghNet.Config.MaxQueueSize then
-			local dropCount = math.floor(#_outboundQueue * 0.5)
-			Log.error("Queue", `CRITICAL: Dropping {dropCount} events to avoid crash.`)
+		queueSize = _queueWriteIndex - _queueReadIndex
 
-			for i = 1, dropCount do 
-				table.remove(_outboundQueue, 1) 
+		if queueSize > KoreghNet.Config.QueueWarningThreshold then 
+			Log.warn("Queue", `Overflow: {queueSize} items remaining.`) 
+		end
+
+		if queueSize > KoreghNet.Config.MaxQueueSize then
+			local dropped = 0
+			local preserved = 0
+
+			for i = _queueWriteIndex - 1, _queueReadIndex, -1 do
+				if queueSize - dropped <= KoreghNet.Config.MaxQueueSize then
+					break
+				end
+
+				local packet = _outboundQueue[i]
+				if packet and packet[1] then
+					if string.match(packet[1], "^__INVOKE_") then
+						preserved += 1
+					else
+						_outboundQueue[i] = nil
+						dropped += 1
+					end
+				end
 			end
+
+			Log.error("Queue", `CRITICAL: Dropped {dropped} non-critical events, preserved {preserved} invoke messages`)
 		end
 
 		-- Send batch
@@ -1112,10 +1227,22 @@ function KoreghNet.Stop()
 	_playerRateLimits = {}
 	_channels = {}
 	_middlewares = {}
+
 	_outboundQueue = {}
+	_queueReadIndex = 1
+	_queueWriteIndex = 1
+
 	CircuitBreakers = {}
 	_invokeHandlers = {}
+
+	for requestId, request in pairs(_pendingInvokes) do
+		if request.TimeoutTask then
+			task.cancel(request.TimeoutTask)
+		end
+		request.Reject("System stopped")
+	end
 	_pendingInvokes = {}
+	_playerInvokeCount = {}
 
 	BufferPoolLock = true
 	BufferPool = {}
