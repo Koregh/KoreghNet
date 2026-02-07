@@ -89,7 +89,6 @@ Net.Send("DamagePlayer", 25, workspace.Dummy.Head.Position, workspace.Dummy.Head
 
 ## Performance
 
-* Up to 10x faster than JSON
 * Automatic buffer reuse
 * Event batching
 * Low latency (<16ms)
