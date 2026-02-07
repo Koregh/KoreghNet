@@ -1,5 +1,4 @@
 --!strict
-
 local Types = require(script.Types)
 
 local KoreghNet = {
@@ -37,6 +36,41 @@ local KoreghNet = {
 		-- Internal
 		Started = false,
 	}
+}
+
+local PlayerPenalties: {[Player]: {
+	Score: number,
+	BlockedUntil: number,
+	ViolationHistory: {{Type: string, Timestamp: number, Points: number}},
+	LastDecay: number
+}} = {}
+
+local PenaltyConfig = {
+	-- Score System
+	MaxScore = 100, -- Maximum score before extreme punishments.
+	DecayRate = 5, -- Points removed per second when there are no new violations.
+	DecayInterval = 1, -- Interval in seconds to apply score decay.
+
+	-- Violation Definitions
+	Violations = {
+		InvalidContract = { Points = 1, BaseBlockTime = 1 },
+		RateLimit = { Points = 3, BaseBlockTime = 2 },
+		BufferOverflow = { Points = 10, BaseBlockTime = 10 },
+		InvalidPayload = { Points = 5, BaseBlockTime = 5 },
+		CircuitBreaker = { Points = 15, BaseBlockTime = 15 },
+		MaliciousPattern = { Points = 25, BaseBlockTime = 30 },
+		SpoofAttempt = { Points = 50, BaseBlockTime = 60 },
+	},
+
+	-- Score Multipliers
+	ScoreMultipliers = {
+		{Threshold = 0, Multiplier = 1},     
+		{Threshold = 20, Multiplier = 1.5},   
+		{Threshold = 40, Multiplier = 2},     
+		{Threshold = 60, Multiplier = 3},     
+		{Threshold = 80, Multiplier = 5},    
+		{Threshold = 100, Multiplier = 10},   
+	},
 }
 
 local Log = {}
@@ -460,13 +494,14 @@ end
 
 local function CleanupPlayerData(player: Player)
 	_playerRateLimits[player] = nil
+	PlayerPenalties[player] = nil 
 
 	for eventName, breaker in pairs(CircuitBreakers) do
 		if breaker.LastPlayer == player then
 			breaker.LastPlayer = nil
 		end
 	end
-	
+
 	local playerId = player.UserId
 	for requestId, request in pairs(_pendingInvokes) do
 		if request.PlayerId == playerId then
@@ -913,6 +948,144 @@ local function ValidateConfig()
 
 end
 
+local function GetPenaltyMultiplier(score: number): number
+	local multiplier = 1
+
+	for i = #PenaltyConfig.ScoreMultipliers, 1, -1 do
+		local tier = PenaltyConfig.ScoreMultipliers[i]
+		if score >= tier.Threshold then
+			multiplier = tier.Multiplier
+			break
+		end
+	end
+
+	return multiplier
+end
+
+local function InitializePlayerPenalty(player: Player)
+	if not PlayerPenalties[player] then
+		PlayerPenalties[player] = {
+			Score = 0,
+			BlockedUntil = 0,
+			ViolationHistory = {},
+			LastDecay = os.clock()
+		}
+	end
+end
+
+local function ApplyScoreDecay(player: Player)
+	local penalty = PlayerPenalties[player]
+	if not penalty then return end
+
+	local now = os.clock()
+	local timeSinceDecay = now - penalty.LastDecay
+
+	if timeSinceDecay >= PenaltyConfig.DecayInterval then
+		local decayAmount = PenaltyConfig.DecayRate * math.floor(timeSinceDecay / PenaltyConfig.DecayInterval)
+		penalty.Score = math.max(0, penalty.Score - decayAmount)
+		penalty.LastDecay = now
+
+		if KoreghNet.Config.Debug and decayAmount > 0 then
+			Log.debug("Penalty", `Player {player.Name} score decayed by {decayAmount} (now: {penalty.Score})`)
+		end
+	end
+end
+
+function KoreghNet.RecordViolation(player: Player, violationType: string): boolean
+	InitializePlayerPenalty(player)
+	ApplyScoreDecay(player)
+
+	local violation = PenaltyConfig.Violations[violationType]
+	if not violation then
+		Log.warn("Penalty", `Unknown violation type: {violationType}`)
+		return false
+	end
+
+	local penalty = PlayerPenalties[player]
+	local oldScore = penalty.Score
+
+	-- Adiciona pontos da violação
+	penalty.Score = math.min(PenaltyConfig.MaxScore, penalty.Score + violation.Points)
+
+	-- Registra no histórico
+	table.insert(penalty.ViolationHistory, {
+		Type = violationType,
+		Timestamp = os.clock(),
+		Points = violation.Points
+	})
+
+	-- Limita histórico a últimas 50 violações
+	if #penalty.ViolationHistory > 50 then
+		table.remove(penalty.ViolationHistory, 1)
+	end
+
+	-- Calcula tempo de bloqueio baseado no score
+	local multiplier = GetPenaltyMultiplier(penalty.Score)
+	local blockTime = violation.BaseBlockTime * multiplier
+	local now = os.clock()
+
+	-- Estende o bloqueio se já estiver bloqueado
+	if penalty.BlockedUntil > now then
+		penalty.BlockedUntil = penalty.BlockedUntil + blockTime
+	else
+		penalty.BlockedUntil = now + blockTime
+	end
+
+	Log.warn("Penalty", 
+		`Player {player.Name} - Violation: {violationType} | ` ..
+			`Score: {oldScore} -> {penalty.Score} | ` ..
+			`Multiplier: {multiplier}x | ` ..
+			`Blocked for: {math.floor(blockTime)}s (until {math.floor(penalty.BlockedUntil - now)}s remaining)`
+	)
+
+	-- Se atingiu score máximo, considera ban temporário
+	if penalty.Score >= PenaltyConfig.MaxScore then
+		Log.critical("Penalty", `Player {player.Name} reached max penalty score! Extended block applied.`)
+	end
+
+	return true
+end
+
+function KoreghNet.IsPlayerBlocked(player: Player): boolean
+	InitializePlayerPenalty(player)
+	ApplyScoreDecay(player)
+
+	local penalty = PlayerPenalties[player]
+	local now = os.clock()
+
+	if penalty.BlockedUntil > now then
+		if KoreghNet.Config.Debug then
+			Log.debug("Penalty", `Player {player.Name} is blocked for {math.floor(penalty.BlockedUntil - now)}s more`)
+		end
+		return true
+	end
+
+	return false
+end
+
+function KoreghNet.GetPlayerPenaltyInfo(player: Player)
+	InitializePlayerPenalty(player)
+	ApplyScoreDecay(player)
+
+	local penalty = PlayerPenalties[player]
+	local now = os.clock()
+
+	return {
+		Score = penalty.Score,
+		MaxScore = PenaltyConfig.MaxScore,
+		IsBlocked = penalty.BlockedUntil > now,
+		BlockedTimeRemaining = math.max(0, penalty.BlockedUntil - now),
+		CurrentMultiplier = GetPenaltyMultiplier(penalty.Score),
+		ViolationCount = #penalty.ViolationHistory,
+		RecentViolations = penalty.ViolationHistory,
+	}
+end
+
+function KoreghNet.ResetPlayerPenalty(player: Player)
+	PlayerPenalties[player] = nil
+	Log.info("Penalty", `Player {player.Name} penalty reset`)
+end
+
 function KoreghNet.GetHealth()
 	local queueSize = _queueWriteIndex - _queueReadIndex
 	local errorRate = Metrics.TotalErrors / math.max(1, Metrics.TotalEvents)
@@ -960,6 +1133,16 @@ function KoreghNet.GetHealth()
 end
 
 function KoreghNet.GetMetrics()
+	local blockedPlayers = 0
+	local totalPenaltyScore = 0
+
+	for player, penalty in pairs(PlayerPenalties) do
+		totalPenaltyScore += penalty.Score
+		if penalty.BlockedUntil > os.clock() then
+			blockedPlayers += 1
+		end
+	end
+
 	return {
 		TotalEvents = Metrics.TotalEvents,
 		EventsPerSecond = Metrics.EventsPerSecond,
@@ -975,6 +1158,11 @@ function KoreghNet.GetMetrics()
 		InvokeErrors = Metrics.InvokeErrors,
 		InvokeSuccesses = Metrics.InvokeSuccesses,
 		InvokeRejectedDuplicates = Metrics.InvokeRejectedDuplicates,
+
+		-- Penalty System Metrics
+		BlockedPlayers = blockedPlayers,
+		TotalPenaltyScore = totalPenaltyScore,
+		TrackedPlayers = #PlayerPenalties,
 	}
 end
 
@@ -1056,6 +1244,15 @@ function KoreghNet.UnregisterChannel(eventName: string): boolean
 end
 
 function KoreghNet._onEvent(player: Player?, eventName: string, payload: any)
+	
+	if player and KoreghNet.IsPlayerBlocked(player) then
+		if KoreghNet.Config.Debug then
+			local info = KoreghNet.GetPlayerPenaltyInfo(player)
+			Log.warn("Blocked", `Player {player.Name} blocked - {math.floor(info.BlockedTimeRemaining)}s remaining`)
+		end
+		return
+	end
+	
 	local ch = _channels[eventName]
 	if not ch then
 		Log.debug("Event", `Unregistered channel: {eventName}`)
@@ -1063,6 +1260,9 @@ function KoreghNet._onEvent(player: Player?, eventName: string, payload: any)
 	end
 
 	if player and IsRateLimited(player, eventName) then 
+		--
+		KoreghNet.RecordViolation(player, "RateLimit")
+		--
 		if KoreghNet.Config.Debug then 
 			Log.warn("RateLimit", `Player {player.Name} exceeded limit on {eventName}`) 
 		end
@@ -1088,11 +1288,18 @@ function KoreghNet._onEvent(player: Player?, eventName: string, payload: any)
 		local success, result, err = pcall(contract.Schema, args)
 
 		if not success then
+			if player then
+				KoreghNet.RecordViolation(player, "InvalidContract")
+			end
+			
 			KoreghNet.LogEvent(eventName, player, "Schema Crash: " .. tostring(result), args)
 			return
 		end
 
 		if not result then
+			if player then
+				KoreghNet.RecordViolation(player, "InvalidContract")
+			end
 			KoreghNet.LogEvent(eventName, player, err or "Schema Validation Failed", args)
 			return
 		end
@@ -1101,6 +1308,9 @@ function KoreghNet._onEvent(player: Player?, eventName: string, payload: any)
 	Metrics.RecordEvent(eventName)
 
 	if ShouldBreakCircuit(eventName) then
+		if player then
+			KoreghNet.RecordViolation(player, "CircuitBreaker")
+		end
 		Log.warn("Circuit", `Event blocked by circuit breaker: {eventName}`)
 		return
 	end
@@ -1144,17 +1354,25 @@ function KoreghNet.Start()
 	-- Server-side event handling
 	if RunService:IsServer() then
 		_gateway.OnServerEvent:Connect(function(player, batch)
+			
+			if KoreghNet.IsPlayerBlocked(player) then
+				return
+			end
+			
 			if typeof(batch) ~= "table" then 
+				KoreghNet.RecordViolation(player, "InvalidPayload")
 				Log.warn("Gateway", `Player {player.Name} enviou batch inválido`)
 				return 
 			end
 
 			if #batch > KoreghNet.Config.BatchLimit then 
+				KoreghNet.RecordViolation(player, "BufferOverflow")
 				Log.warn("Gateway", `Player {player.Name} excedeu BatchLimit: {#batch}`)
 				return 
 			end
 
 			if IsRateLimited(player, "__GLOBAL__") then 
+				KoreghNet.RecordViolation(player, "RateLimit")
 				return 
 			end
 
