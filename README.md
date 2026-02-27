@@ -97,6 +97,6 @@ Net.Send("DamagePlayer", 25, workspace.Dummy.Head.Position, workspace.Dummy.Head
 
 ## FAQ
 
-* **Can I send Instances?** → Only references (paths), not full objects.
+* **Can I send Instances?** → Only references (paths), not full objects (CHANGES BEING APPLIED).
 * **Rate limits:** → Both global and per-player.
 * **Circuit breaker triggered?** → Events are dropped for X seconds.
