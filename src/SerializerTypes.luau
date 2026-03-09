@@ -421,53 +421,100 @@ RegisterHandler("dictionary",
 -- INSTANCE (ID: 15)
 RegisterHandler("Instance",
 	function(b, cur, inst: Instance)
-		local path = inst:GetFullName()
-		local len = #path
+		local segments: {{name: string, idx: number}} = {}
+		local current = inst
 
-		if Config.ValidateOnWrite and len > Config.MaxStringLength then
-			error(`Instance path too long: {len}`)
+		while current and current ~= game do
+			local parent = current.Parent
+			if not parent then break end
+
+			local name = current.Name
+			local disambigIdx = 1
+
+			for _, sibling in ipairs(parent:GetChildren()) do
+				if sibling == current then break end
+				if sibling.Name == name then
+					disambigIdx += 1
+				end
+			end
+
+			table.insert(segments, 1, { name = name, idx = disambigIdx })
+			current = parent
 		end
 
-		buffer.writeu16(b, cur, len)
-		buffer.writestring(b, cur + 2, path, len)
-		return 2 + len
+		local depth = #segments
+
+		if Config.ValidateOnWrite and depth > 255 then
+			error(`Instance hierarchy too deep: {depth}`)
+		end
+
+		buffer.writeu8(b, cur, depth)
+		local total = 1
+
+		for _, seg in ipairs(segments) do
+			local nameLen = #seg.name
+
+			if Config.ValidateOnWrite and nameLen > 255 then
+				error(`Instance name too long: {seg.name}`)
+			end
+
+			buffer.writeu8(b, cur + total, nameLen)
+			buffer.writestring(b, cur + total + 1, seg.name, nameLen)
+			buffer.writeu8(b, cur + total + 1 + nameLen, seg.idx)
+			total += 1 + nameLen + 1
+		end
+
+		return total
 	end,
 	function(b, cur)
-		if Config.ValidateOnRead and not ValidateBuffer(b, cur, 2) then
-			error("Buffer overflow reading Instance path length")
+		if Config.ValidateOnRead and not ValidateBuffer(b, cur, 1) then
+			error("Buffer overflow reading Instance depth")
 		end
 
-		local len = buffer.readu16(b, cur)
+		local depth = buffer.readu8(b, cur)
+		local total = 1
+		local current: Instance = game
 
-		if Config.ValidateOnRead and not ValidateBuffer(b, cur + 2, len) then
-			error("Buffer overflow reading Instance path")
-		end
+		for _ = 1, depth do
+			if Config.ValidateOnRead and not ValidateBuffer(b, cur + total, 1) then
+				error("Buffer overflow reading Instance segment nameLen")
+			end
 
-		local path = buffer.readstring(b, cur + 2, len)
+			local nameLen = buffer.readu8(b, cur + total)
+			total += 1
 
-		-- Attempt to resolve path
-		local success, result = pcall(function()
-			local parts = string.split(path, ".")
-			local current = game
+			if Config.ValidateOnRead and not ValidateBuffer(b, cur + total, nameLen + 1) then
+				error("Buffer overflow reading Instance segment")
+			end
 
-			for _, part in ipairs(parts) do
-				if part ~= "game" then
-					current = current:FindFirstChild(part)
-					if not current then
-						error(`Failed to resolve path: {path}`)
+			local name = buffer.readstring(b, cur + total, nameLen)
+			total += nameLen
+
+			local disambigIdx = buffer.readu8(b, cur + total)
+			total += 1
+
+			-- Resolve by name + disambig index (immune to duplicate sibling names)
+			local count = 0
+			local found: Instance? = nil
+			for _, child in ipairs(current:GetChildren()) do
+				if child.Name == name then
+					count += 1
+					if count == disambigIdx then
+						found = child
+						break
 					end
 				end
 			end
 
-			return current
-		end)
+			if not found then
+				warn(`Failed to resolve Instance segment "{name}"[{disambigIdx}]`)
+				return nil, total
+			end
 
-		if not success then
-			warn(`Failed to deserialize Instance: {result}`)
-			return nil, 2 + len
+			current = found
 		end
 
-		return result, 2 + len
+		return current, total
 	end
 )
 
@@ -630,14 +677,13 @@ function SerializerTypes.EstimateSize(val: any): number
 	elseif t == "Color3" then return 4 -- Type ID + 3*u8
 	elseif t == "UDim2" then return 17 -- Type ID + 4*f32
 	elseif t == "table" then
-		
-		local size = 3 
-		for i = 1, math.min(#val, 100) do 
+		local size = 3
+		for i = 1, math.min(#val, 100) do
 			size += SerializerTypes.EstimateSize(val[i])
 		end
 		return size
 	else
-		return 50 
+		return 50
 	end
 end
 
